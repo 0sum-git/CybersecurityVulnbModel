@@ -3,7 +3,10 @@ import json
 from sklearn.model_selection import GroupShuffleSplit
 
 def dataset_processing(json_file: json) ->  pd.core.frame.DataFrame:
-
+    '''
+    Preprocess dataset based on code vulnerability: each question has a corresponding safe and vulnerable code column, we split an entry into 2 entries
+    Easier to then classify code as being vulnerable or not
+    '''
     df = pd.read_json(json_file, lines=True)
 
     df_chosen = df[['question', 'chosen']].copy()
