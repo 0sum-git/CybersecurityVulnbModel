@@ -13,7 +13,7 @@
 
 Esta estrutura de sequência é fundamental para o processo de atenção cruzada (cross-attention) entre a pergunta e o código durante o processamento pelo modelo, permitindo que o contexto da pergunta influencie a interpretação do código.
 
-### processo de Tokenização
+### processo de tokenização
 
 O processo de tokenização é implementado utilizando os seguintes parâmetros técnicos:
 
