@@ -25,7 +25,7 @@ def dataset_processing(json_file: json) ->  pd.core.frame.DataFrame:
     df_chosen = df_chosen.rename(columns={'chosen': 'code'})
     df_chosen['isvuln'] = False
 
-    df_rejected = df[['question', 'rejected', 'vulnerability']].copy()
+    df_rejected = df[['question', 'rejected']].copy()
     df_rejected = df_rejected.rename(columns={'rejected': 'code'})
     df_rejected['isvuln'] = True
 
