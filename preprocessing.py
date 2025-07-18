@@ -66,19 +66,23 @@ def shuffle_dataset(df: pd.core.frame.DataFrame) -> tuple[pd.DataFrame, pd.DataF
 
 def tokenize_dataset(df, tokenizer=None):
     '''
-    tokenizes all code in a dataframe using robertatokenizer.
+    tokenizes all code and questions in a dataframe using robertatokenizer.
+    format: [CLS] question [SEP] code [SEP]
 
     args:
-        df (pd.DataFrame): dataframe containing a 'code' column
+        df (pd.DataFrame): dataframe containing 'code' and 'question' columns
         tokenizer (RobertaTokenizer, optional): tokenizer instance. if none, creates a new instance.
 
     returns:
-        pd.DataFrame: original dataframe with additional columns for tokens
+        pd.DataFrame: original dataframe with additional columns for tokens and a new dataframe with overflow chunks if any
     '''
 
     if 'code' not in df.columns:
         console.print("[bold red]ERROR:[/bold red] df must contain a 'code' column")
         raise ValueError("df must contain a 'code' column")
+
+    if 'question' not in df.columns:
+        console.print("[bold yellow]WARNING:[/bold yellow] df does not contain a 'question' column. Only code will be tokenized.")
 
     if tokenizer is None:
         console.print(" initializing tokenizer...", style="cyan")
@@ -90,6 +94,10 @@ def tokenize_dataset(df, tokenizer=None):
     # lists to store tokenization results
     input_ids_list = []
     attention_mask_list = []
+    has_overflow_list = []
+    
+    # list to store overflow chunks as separate dataframe rows
+    overflow_chunks = []
 
     with Progress(
         TextColumn("[bold blue]{task.description}"),
@@ -102,17 +110,43 @@ def tokenize_dataset(df, tokenizer=None):
         console=console,
         expand=True
     ) as progress:
-        task = progress.add_task("[cyan]tokenizing code...[/cyan]", total=len(df))
+        task = progress.add_task("[cyan]tokenizing question and code...[/cyan]", total=len(df))
         
-        for i, code in enumerate(df['code']):
-            tokens = tokenize_code(code, tokenizer)
+        for i, row in df.iterrows():
+            code = row['code']
+            question = row['question']
+            
+            tokens = tokenize_code(code, question, tokenizer)
             input_ids_list.append(tokens['input_ids'])
             attention_mask_list.append(tokens['attention_mask'])
+            has_overflow_list.append(tokens['has_overflow'])
+            
+            # if we have overflowing tokens, create additional chunks
+            if tokens['has_overflow'] and 'overflowing_tokens' in tokens:
+                # create a copy of the current row for each overflow chunk
+                for chunk_idx, overflow_tokens in enumerate(tokens['overflowing_tokens']):
+                    overflow_row = row.copy()
+                    overflow_row['chunk_idx'] = chunk_idx + 1
+                    overflow_row['input_ids'] = overflow_tokens
+                    overflow_row['attention_mask'] = tokens.get('overflow_attention_mask', [None])[chunk_idx] if 'overflow_attention_mask' in tokens else None
+                    overflow_chunks.append(overflow_row)
             
             progress.update(task, advance=1)
 
     result_df['input_ids'] = input_ids_list
     result_df['attention_mask'] = attention_mask_list
+    result_df['has_overflow'] = has_overflow_list
+    result_df['chunk_idx'] = 0
+    
+    # create a dataframe with overflow chunks if any
+    overflow_df = None
+    if overflow_chunks:
+        console.print(f"[bold yellow]Found {len(overflow_chunks)} overflow chunks[/bold yellow]")
+        overflow_df = pd.DataFrame(overflow_chunks)
+        
+        # combine the main dataframe with overflow chunks :)))))))))))))))))))))
+        result_df = pd.concat([result_df, overflow_df], ignore_index=True)
+        console.print(f"[bold green]Combined dataframe has {len(result_df)} rows[/bold green]")
 
     console.print(
         Text("tokenization completed!", style="bold green")
@@ -120,16 +154,18 @@ def tokenize_dataset(df, tokenizer=None):
     
     return result_df
 
-def tokenize_code(code_text, tokenizer=None):
+def tokenize_code(code_text, question, tokenizer=None):
     '''
-    tokenizes the code using robertatokenizer.
+    tokenizes the code and question (if provided) using robertatokenizer.
+    format: [CLS] question [SEP] code [SEP]
 
     args:
         code_text (str): code text to be tokenized
+        question (str, optional): question text to be tokenized together with code
         tokenizer (RobertaTokenizer, optional): tokenizer instance. if none, creates a new instance.
 
     returns:
-        dict: dictionary containing input_ids and attention_mask
+        dict: dictionary containing input_ids and attention_mask, and overflowing_tokens if any
     '''
     
     if tokenizer is None:
@@ -142,18 +178,45 @@ def tokenize_code(code_text, tokenizer=None):
     if match:
         code_text = match.group(1)
 
+    # format: [CLS] question [SEP] code [SEP]
     encoded = tokenizer(
+        question,
         code_text,
         padding='max_length',
-        truncation=True,
+        truncation='only_second',
         max_length=MAX_LENGTH,
-        return_tensors='pt'
+        return_tensors='pt',
+        return_overflowing_tokens=True,
+        stride=128
     )
 
-    return {
+    # check if we have overflowing tokens
+    has_overflow = 'overflowing_tokens' in encoded and len(encoded['overflowing_tokens']) > 0
+    
+    result = {
         'input_ids': encoded['input_ids'].squeeze(),
-        'attention_mask': encoded['attention_mask'].squeeze()
+        'attention_mask': encoded['attention_mask'].squeeze(),
+        'has_overflow': has_overflow
     }
+    
+    # if we have overflowing tokens, add them to the result
+    if has_overflow:
+        result['overflowing_tokens'] = encoded['overflowing_tokens']
+        
+        # extract attention masks for overflowing tokens if available
+        if 'overflow_to_sample_mapping' in encoded:
+            result['overflow_to_sample_mapping'] = encoded['overflow_to_sample_mapping']
+            
+        # create attention masks for overflowing tokens if not provided by the tokenizer
+        if 'attention_mask' in encoded:
+            overflow_attention_masks = []
+            for overflow_ids in encoded['overflowing_tokens']:
+                # create attention mask (1 for all tokens)
+                overflow_attention_mask = torch.ones_like(overflow_ids)
+                overflow_attention_masks.append(overflow_attention_mask)
+            result['overflow_attention_mask'] = overflow_attention_masks
+        
+    return result
 
 def run_preprocessing_pipeline():
     """
@@ -228,13 +291,20 @@ def run_preprocessing_pipeline():
     ))
 
     decoded_texts = []
+    decoded_texts_with_special = []
+    
     for i, row in tokenized_df.head(1).iterrows():
+        # Decode without skipping special tokens to show the full structure
+        decoded_text_with_special = tokenizer.decode(row['input_ids'])
+        decoded_texts_with_special.append(decoded_text_with_special)
+        
+        # Decode skipping special tokens for readability
         decoded_text = tokenizer.decode(row['input_ids'], skip_special_tokens=True)
         decoded_texts.append(decoded_text)
 
     decoded_sample = tokenized_df.head(1)[['question', 'isvuln', 'code']].copy()
     decoded_sample['decoded_text'] = decoded_texts
-    decoded_sample = decoded_sample.drop(columns=['question','isvuln'])
+    decoded_sample['decoded_text_with_special'] = decoded_texts_with_special
     
     console.print("\ndecoded check:", style="green")
 
@@ -246,13 +316,17 @@ def run_preprocessing_pipeline():
         row_styles=["dim", ""]
     )
     table.add_column("Entry", style="bold yellow", justify="center", width=5)
-    table.add_column("Code", style="dim")
-    table.add_column("Decoded Text", style="cyan")
+    table.add_column("Question", style="dim", width=30)
+    table.add_column("Code", style="dim", width=30)
+    table.add_column("Decoded Text (with special tokens)", style="cyan")
+    table.add_column("Decoded Text (without special tokens)", style="green")
     
     for i, (_, row) in enumerate(decoded_sample.iterrows(), 1):
         table.add_row(
             str(i),
-            row['code'],
+            row['question'][:30] + "..." if len(row['question']) > 30 else row['question'],
+            row['code'][:30] + "..." if len(row['code']) > 30 else row['code'],
+            row['decoded_text_with_special'],
             row['decoded_text']
         )
     
