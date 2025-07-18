@@ -1,3 +1,7 @@
 datasets
 rich
 PyGithub
+torch
+transformers
+pandas
+scikit-learn
